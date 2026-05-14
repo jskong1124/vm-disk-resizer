@@ -86,7 +86,7 @@ fi
 case "$ID-$OS_MAJOR_VERSION" in
     centos-7|centos-8)             ;;  # CentOS 7, 8 Stream
     rhel-7|rhel-8|rhel-9)          ;;  # RHEL 7, 8, 9
-    rocky-8|rocky-9|rocky-10)      ;;  # Rocky Linux 8, 9, 10 -- 테스트예정
+    rocky-8|rocky-9|rocky-10)      ;;  # Rocky Linux 8, 9, 10
     almalinux-8|almalinux-9)       ;;  # AlmaLinux 8, 9
     ol-7|ol-8|ol-9)                ;;  # Oracle Linux 7, 8, 9
     ubuntu-20|ubuntu-22|ubuntu-24) ;;  # Ubuntu 20, 22, 24
@@ -110,9 +110,44 @@ FILE_TYPE=$(df -T | grep -w '/' | awk '{print $2}')
 VG_NAME=$(lvs --noheadings -o vg_name "$FILE_PATH" | xargs)
 LV_NAME=$(lvs --noheadings -o lv_name "$FILE_PATH" | xargs)
 LV_PATH="/dev/$VG_NAME/$LV_NAME"
-PV_NAME=$(pvs --noheadings -o pv_name,vg_name | grep -w "$VG_NAME" | awk '{print $1}')
+
+ALL_PV_LIST=$(pvs --noheadings -o pv_name,vg_name | awk -v vg="$VG_NAME" '$2 == vg {print $1}')
+
+PV_NAME=""
+
+for PV in $ALL_PV_LIST
+do
+  DISK=$(echo "$PV" | sed 's/[0-9]*$//')
+  PART=$(echo "$PV" | sed 's/.*[^0-9]\([0-9]*\)$/\1/')
+
+  LAST_PART=$(lsblk -ln -o NAME "$DISK" | awk -v disk="$(basename "$DISK")" '
+    $1 != disk {
+      gsub(/[^0-9]/, "", $1)
+      if ($1 > max) max=$1
+    }
+    END {print max}
+  ')
+
+  if [ "$PART" = "$LAST_PART" ]; then
+    PV_NAME="$PV"
+    break
+  fi
+done
+
+if [ -z "$PV_NAME" ]; then
+  printf "${C_RED}Error: No expandable PV found.${C_RESET}\n"
+  exit 1
+fi
+
+PV_SIZE=$(pvs --noheadings -o pv_size "$PV_NAME" | xargs)
+PV_FREE=$(pvs --noheadings -o pv_free "$PV_NAME" | xargs)
+
+echo "  > Auto-selected expandable PV:"
+echo "    ${PV_NAME} (Size:${PV_SIZE} Free:${PV_FREE})"
+
 DISK_NAME=$(echo "$PV_NAME" | sed 's/[0-9]*$//')
 PART_NUM=$(echo "$PV_NAME" | sed 's/.*[^0-9]\([0-9]*\)$/\1/')
+
 echo "  - LV Path         : ${FILE_PATH}"
 echo "  - Filesystem Type : ${FILE_TYPE}"
 echo "  - Volume Group    : ${VG_NAME}"
@@ -123,7 +158,7 @@ echo "  - Partition Num   : ${PART_NUM}"
 echo
 
 
-# [Step 5] 파티션 확장
+# [Step 5] 파티션 확장 - 개발중
 #if [ "$ID" = "ubuntu" ]; then
 #    # growpart
 #    print_step_header "[Step 5] Expanding Partition using growpart..."
@@ -157,16 +192,16 @@ if command -v growpart >/dev/null 2>&1; then
     echo "  > Partition expanded successfully."
 else
     if [ "$ID" = "ubuntu" ]; then
-	    printf "${C_RED}Error: 'growpart' command not found.${C_RESET}\n"
-		printf "${C_YELLOW}Hint: On Ubuntu/Debian run 'sudo apt install -y cloud-guest-utils'${C_RESET}\n"
+            printf "${C_RED}Error: 'growpart' command not found.${C_RESET}\n"
+                printf "${C_YELLOW}Hint: On Ubuntu/Debian run 'sudo apt install -y cloud-guest-utils'${C_RESET}\n"
         exit 1
     else
-	    printf "${C_YELLOW}Notice: 'growpart' command not found. Trying parted...${C_RESET}\n"
+            printf "${C_YELLOW}Notice: 'growpart' command not found. Trying 'parted'...${C_RESET}\n"
         printf "${C_YELLOW}Hint: For best results, On RHEL/CentOS run 'sudo yum install -y cloud-utils-growpart'${C_RESET}\n"
         print_step_header "[Step 5] Expanding Partition using parted (Fallback)..."
         if ! command -v parted >/dev/null 2>&1; then
             printf "${C_RED}Error: Fallback command 'parted' also not found.${C_RESET}\n"
-			printf "${C_YELLOW}Hint: On RHEL/CentOS run 'sudo yum install -y parted'${C_RESET}\n"
+                        printf "${C_YELLOW}Hint: On RHEL/CentOS run 'sudo yum install -y parted'${C_RESET}\n"
             exit 1
         fi
         parted -s -- "$DISK_NAME" resizepart "$PART_NUM" 100%
@@ -174,8 +209,8 @@ else
     fi
 fi
 echo
-	
-	
+
+
 
 # [Step 6] 물리 볼륨(PV) 사이즈 변경
 print_step_header "[Step 6] Resizing Physical Volume (PV)..."
@@ -183,6 +218,21 @@ pvresize_output=$(pvresize "$PV_NAME" 2>&1)
 echo "  > PV resized successfully."
 echo "     ${pvresize_output}"
 echo
+
+VG_FREE_COUNT=$(vgs --noheadings -o vg_free_count "$VG_NAME" | xargs)
+
+if [ "$VG_FREE_COUNT" -eq 0 ]; then
+  echo "  > No free space available in Volume Group '${VG_NAME}'."
+  echo "  > Disk/PV is already fully resized. Nothing to extend."
+  echo
+
+  print_step_header "[Final] Checking Current Disk Size..."
+  df -hT / | awk -v cyan="$C_CYAN" -v reset="$C_RESET" 'NR==1 {printf "       %s\n", $0} NR==2 {printf "       %s%s%s\n", cyan, $0, reset}'
+  echo
+
+  printf "> ${C_YELLOW}Disk Resize Already Completed. No changes required.${C_RESET}\n"
+  exit 0
+fi
 
 # [Step 7] 논리 볼륨(LV) 확장
 print_step_header "[Step 7] Extending Logical Volume (LV)..."
